@@ -15,6 +15,16 @@ from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_di
 POINTER = "latest_checkpointed_iteration.txt"
 
 
+def collective_device():
+    """Explicit device for object collectives: the NCCL rank's current CUDA device, or CPU for Gloo.
+
+    Gloo never queries CUDA, so the CPU test path stays clean on hosts without a GPU.
+    """
+    if dist.get_backend() == "nccl":
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
 def select_checkpoint(run_dir, resume, restart):
     """A new invocation requires a new directory; every restart requires a completed save."""
     root = Path(run_dir)
@@ -27,7 +37,7 @@ def select_checkpoint(run_dir, resume, restart):
             selected[0] = step
         else:
             root.mkdir(parents=True, exist_ok=False)
-    dist.broadcast_object_list(selected, src=0)
+    dist.broadcast_object_list(selected, src=0, device=collective_device())
     return selected[0]
 
 

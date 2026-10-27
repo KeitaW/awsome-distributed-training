@@ -2,6 +2,14 @@
 
 This example runs a normal GPT-2 training loop with PyTorch DDP or FSDP. One `sbatch` allocation starts one `ft_launcher` per node through `srun`. NVRx monitors real setup, update and checkpoint sections and restarts failed workers within that allocation. Fresh workers load the last completed PyTorch checkpoint and replay any unsaved updates. There is no Megatron dependency or external job controller.
 
+Quick route for first-time readers:
+
+1. [Build the Slurm image](#requirements-and-build) and import it as a squashfs on every node.
+2. [Submit the synthetic `--tiny` control](#0-submit-training) with `--strategy=ddp` into a new run directory.
+3. [Add `--fault-step=3 --fault-rank=1`](#worker-recovery-and-checkpoints) in another new run directory to watch replacement ranks load checkpoint 2 and finish.
+
+Each linked section carries the environment exports, paths and caveats that the commands need.
+
 ## Requirements and build
 
 Use an existing Slurm GPU partition, Pyxis/Enroot, a CUDA-13-compatible driver and a shared POSIX filesystem visible at the same absolute path on every node. The submitting UID must be able to write its run directory and the container's short node-local socket directory. Nodes must have working NCCL connectivity. The batch entry resolves the first node's Slurm `NodeAddr`, so PCS scheduler aliases need not resolve in DNS. The recipe assumes IPv4 or a DNS address, not an IPv6 literal.
@@ -55,6 +63,8 @@ For a matched no-NVRx control, set `NVRX_LAUNCHER=torchrun`, choose another new 
 `src/training_checkpoint.py` saves model and AdamW state, the learning-rate scheduler, Python/NumPy/Torch/CUDA RNG and each logical rank's next batch cursor. DDP uses per-rank `torch.save` files. FSDP saves sharded model/optimizer state with PyTorch Distributed Checkpoint (DCP), plus per-rank extras. A rank always restores its own RNG and cursor even if the launcher's node placement changes. Resume requires the same world size, per-node GPU count, strategy, precision, inputs and update settings.
 
 All ranks finish their writes before rank 0 atomically replaces `latest_checkpointed_iteration.txt`. That pointer is the only checkpoint selector and NVRx's progress input. An interrupted later `step_N` directory is not selected; a retry can finish writing that step. Checkpoints are retained, so budget storage for every save. This protocol covers worker failure, not storage corruption or physical power-loss durability. Missing or unreadable selected state fails the run; it never falls back to older weights or starts from zero. Arbitrary storage corruption is not detected. Load only trusted checkpoints: rank state uses Python pickle.
+
+Security note on checkpoint and token inputs. `src/training_checkpoint.py` restores each rank's file with `torch.load(..., weights_only=False)` because it holds Python and NumPy RNG state, scheduler state and the settings dictionary, not only tensors. That unrestricted unpickler can execute arbitrary code from a crafted file on any PyTorch version, so only load checkpoints that this example wrote under your control. The pinned PyTorch 2.9.0 is also in the affected range of [CVE-2026-24747 (GHSA-63cw-57p8-fm3p)](https://github.com/pytorch/pytorch/security/advisories/GHSA-63cw-57p8-fm3p): a crafted file loaded with the restricted `weights_only=True` unpickler can corrupt memory and potentially execute code in PyTorch 2.9.1 and earlier; `>=2.10.0` is patched. This affects the `--tokens-path` tensor load, which uses `weights_only=True`, so supply only trusted token files. NVIDIA's [upstream sections example](https://github.com/NVIDIA/nvidia-resiliency-ext/blob/ebf0352a82ca5699148ea10bec2b8eedd121e382/examples/fault_tolerance/train_ddp_sections_api.py) saves plain state dictionaries and documents the same guidance: use PyTorch 2.10.0 or newer when the provenance of a `weights_only=True` input is not fully trusted. Upgrading would not make the full-state rank files safe to accept from untrusted sources, and this image keeps the qualified 2.9.0 pin; a dependency change needs its own re-qualification.
 
 A failure before the first completed save has nothing to restore. NVRx may launch its remaining bounded retries, but they fail on the missing pointer without training from scratch or claiming progress. Diagnose the failure and choose a new run directory for a new attempt. There is no step-zero save or synthetic AdamW update.
 
@@ -118,7 +128,7 @@ bash -n slurm/0.train.sbatch
 bash -n slurm/1.launch.sh
 ```
 
-The narrow tests cover new/resume directory rules, incomplete saves, missing or unreadable requested state, causal-LM token boundaries, real two-rank SIGKILL/SIGSTOP recovery with exact final training-state comparison, failure before the first checkpoint and a zero restart budget. They supplement rather than replace Slurm/DDP/FSDP target-hardware runs.
+The narrow tests cover new/resume directory rules, the explicit CPU/CUDA device of the checkpoint-selector broadcast, incomplete saves, missing or unreadable requested state, causal-LM token boundaries, real two-rank SIGKILL/SIGSTOP recovery with exact final training-state comparison, failure before the first checkpoint and a zero restart budget. They supplement rather than replace Slurm/DDP/FSDP target-hardware runs.
 
 ## Attribution
 

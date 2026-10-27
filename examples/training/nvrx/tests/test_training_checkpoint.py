@@ -41,6 +41,29 @@ def test_new_and_required_resume(tmp_path, group):
         ckpt.select_checkpoint(root, True, 0)
 
 
+def test_selector_broadcast_pins_device(tmp_path, group, monkeypatch):
+    """The object broadcast names its device: CPU on Gloo without touching CUDA, the current CUDA device on NCCL.
+
+    The Gloo half runs the real one-rank collective; the NCCL half only checks the device choice, because no GPU or NCCL group exists in this CPU test.
+    """
+    calls = []
+    real_broadcast = dist.broadcast_object_list
+    def record(*args, **kwargs):
+        calls.append(kwargs)
+        return real_broadcast(*args, **kwargs)
+    def no_cuda(*args, **kwargs):
+        raise AssertionError("Gloo path must not query CUDA")
+    with monkeypatch.context() as patch:
+        patch.setattr(dist, "broadcast_object_list", record)
+        patch.setattr(torch.cuda, "current_device", no_cuda)
+        assert ckpt.select_checkpoint(tmp_path / "run", False, 0) is None
+    assert [call.get("device") for call in calls] == [torch.device("cpu")]
+    with monkeypatch.context() as patch:
+        patch.setattr(dist, "get_backend", lambda *args, **kwargs: "nccl")
+        patch.setattr(torch.cuda, "current_device", lambda: 3)
+        assert ckpt.collective_device() == torch.device("cuda", 3)
+
+
 def test_incomplete_save_and_corrupt_resume(tmp_path, group, monkeypatch):
     model, optimizer, scheduler = components()
     settings = {"strategy": "ddp", "world_size": 1}
